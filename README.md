@@ -40,13 +40,18 @@ Build your own AI agent stack in a controlled, production-minded setup.
 
 ## Quick Start
 
-### 1) Install
+### 1) Clone repo
 ```bash
-cd /path/to/fruit-bowl-ai
+git clone https://github.com/fruity-ai/fruit-bowl-ai.git
+cd fruit-bowl-ai
+```
+
+### 2) Install
+```bash
 npm install
 ```
 
-### 2) Configure
+### 3) Configure
 ```bash
 cp .env.example .env
 ```
@@ -61,20 +66,21 @@ Recommended:
 - `MEMORY_ROOT=./memory`
 - `STATE_ROOT=./state`
 
-### 3) (Optional) Install Python dependencies for the example data skill
+### 4) (Optional) Install Python dependencies for the example data skill
 ```bash
 python3 -m pip install pandas openpyxl pyarrow pydantic
 ```
-
-### 4) Start services
-Terminal 1:
+If that fails, create and activate a virtual environment first:
 ```bash
-npm run start:agent
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install pandas openpyxl pyarrow pydantic
 ```
+If you don't want to use the example skill, you can skip this step. You should also remove the `excel-data-handler` from `agent/skills/index.json` and delete the `agent/skills/excel-data-handler` directory.
 
-Terminal 2:
+### 5) Start services
 ```bash
-npm run start:bot
+npm start
 ```
 
 ## Security First (Important)
