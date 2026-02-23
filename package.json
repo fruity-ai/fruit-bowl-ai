@@ -1,0 +1,17 @@
+{
+  "name": "fruit-bowl-ai",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Telegram-first local multi-skill agent boilerplate",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.mjs",
+    "start:bot": "node src/index.mjs",
+    "start:agent": "node src/agent-server.mjs",
+    "start:local-chat": "node src/local-chat.mjs",
+    "test:self-chat": "node src/self-test-chat.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

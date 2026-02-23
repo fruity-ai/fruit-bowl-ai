@@ -1,0 +1,12 @@
+.env
+.DS_Store
+node_modules/
+__pycache__/
+*.pyc
+state/
+memory/data/*
+!memory/data/.gitkeep
+memory/notes/*
+!memory/notes/.gitkeep
+memory/knowledge/*
+!memory/knowledge/.gitkeep

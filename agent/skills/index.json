@@ -1,0 +1,51 @@
+{
+  "skills": [
+    {
+      "id": "excel-data-handler",
+      "name": "Excel Data Handler",
+      "description": "Analyze tabular files (CSV/XLSX/XLS/Parquet) with pandas operations.",
+      "when_to_use": "Use when user asks to inspect, filter, summarize, group, or search structured data files.",
+      "action_contract": "Set action.operation to one of preview, columns, describe, filter_eq, filter_contains, search_text_any_column, groupby_sum, value_counts, python_code. For complex tasks prefer python_code with action.args.code containing executable pandas code. Available helpers in python_code: discover_files(), read_table(rel_path), write_table(df, rel_path), optional preloaded df if action.file is set, and assign final output to variable result.",
+      "entry": "agent/skills/excel-data-handler/SKILL.md",
+      "enabled": true,
+      "root": "${DATAFILES_ROOT}",
+      "operations": [
+        "preview",
+        "columns",
+        "describe",
+        "filter_eq",
+        "filter_contains",
+        "search_text_any_column",
+        "groupby_sum",
+        "value_counts",
+        "python_code"
+      ],
+      "examples": [
+        "vis de første 10 rækker",
+        "hvilke kolonner er der i filen",
+        "find alle rækker der nævner Lars",
+        "gruppér efter category og summer total_sales",
+        "lav et finansielt overblik med summer pr. konto"
+      ],
+      "self_test_questions": [
+        "Giv et hurtigt overblik over Transformed_Financial_Data.csv med antal rækker, datointerval og total Beløb.",
+        "Vis alle unikke datoer i datasættet.",
+        "Find de datoer med højest samlet Beløb."
+      ],
+      "executor": {
+        "type": "python_stdio",
+        "script": "agent/skills/excel-data-handler/executor.py",
+        "contextTimeoutMs": 30000,
+        "executeTimeoutMs": 45000,
+        "context": {
+          "mode": "catalog",
+          "payload": {}
+        },
+        "execute": {
+          "mode": "execute",
+          "payload": {}
+        }
+      }
+    }
+  ]
+}
