@@ -5,7 +5,7 @@
   "description": "Telegram-first local multi-skill agent boilerplate",
   "type": "module",
   "scripts": {
-    "start": "node src/index.mjs",
+    "start": "concurrently \"npm:start:agent\" \"npm:start:bot\"",
     "start:bot": "node src/index.mjs",
     "start:agent": "node src/agent-server.mjs",
     "start:local-chat": "node src/local-chat.mjs",
@@ -13,5 +13,8 @@
   },
   "engines": {
     "node": ">=18"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
   }
 }
