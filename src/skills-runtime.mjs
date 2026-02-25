@@ -1,7 +1,12 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { spawn } from "node:child_process";
-import { pathToFileURL } from "node:url";
+import { pathToFileURL, fileURLToPath } from "node:url";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+const projectRoot = path.resolve(__dirname, "..");
+const venvPython = path.join(projectRoot, ".venv", "bin", "python3");
 
 function replaceTemplates(value, vars) {
   if (typeof value !== "string") return value;
@@ -27,9 +32,19 @@ function resolvePathFromProject(projectRoot, maybePath) {
   return path.isAbsolute(maybePath) ? maybePath : path.resolve(projectRoot, maybePath);
 }
 
-function runPythonJson(scriptPath, payload, timeoutMs = 45_000) {
+async function resolvePython() {
+  try {
+    await fs.access(venvPython);
+    return venvPython;
+  } catch {
+    return "python3";
+  }
+}
+
+async function runPythonJson(scriptPath, payload, timeoutMs = 45_000) {
+  const pythonBin = await resolvePython();
   return new Promise((resolve, reject) => {
-    const child = spawn("python3", [scriptPath], {
+    const child = spawn(pythonBin, [scriptPath], {
       stdio: ["pipe", "pipe", "pipe"],
     });
 
@@ -56,10 +71,22 @@ function runPythonJson(scriptPath, payload, timeoutMs = 45_000) {
     child.on("close", (code) => {
       clearTimeout(timer);
       let parsed = null;
-      try {
-        parsed = stdout.trim() ? JSON.parse(stdout) : null;
-      } catch {
-        // ignore parse errors and report raw text below
+      const raw = stdout.trim();
+      if (raw) {
+        // Try direct parse first, then extract JSON object from mixed output
+        try {
+          parsed = JSON.parse(raw);
+        } catch {
+          const jsonStart = raw.indexOf("{");
+          const jsonEnd = raw.lastIndexOf("}");
+          if (jsonStart !== -1 && jsonEnd > jsonStart) {
+            try {
+              parsed = JSON.parse(raw.slice(jsonStart, jsonEnd + 1));
+            } catch {
+              // still failed — fall through
+            }
+          }
+        }
       }
 
       if (code === 0 && parsed) {

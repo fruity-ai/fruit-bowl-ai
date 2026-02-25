@@ -42,8 +42,19 @@ class DataAction(BaseModel):
     args: Dict[str, Any] = Field(default_factory=dict)
 
 
+def _sanitize(obj: Any) -> Any:
+    """Replace NaN/Inf floats with None so json.dumps produces valid JSON."""
+    if isinstance(obj, float) and (obj != obj or obj == float("inf") or obj == float("-inf")):
+        return None
+    if isinstance(obj, dict):
+        return {k: _sanitize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize(v) for v in obj]
+    return obj
+
+
 def out(payload: Dict[str, Any], code: int = 0) -> None:
-    print(json.dumps(payload, ensure_ascii=False, default=str))
+    print(json.dumps(_sanitize(payload), ensure_ascii=False, default=str))
     raise SystemExit(code)
 
 

@@ -62,7 +62,7 @@ Set at minimum:
 - `ALLOWED_USER_IDS=123456789`
 
 Recommended:
-- `CODEX_MODEL=gpt-codex-5.2`
+- `CODEX_MODEL=gpt-5.2-codex`
 - `MEMORY_ROOT=./memory`
 - `STATE_ROOT=./state`
 

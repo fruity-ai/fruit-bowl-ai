@@ -95,17 +95,19 @@ function buildHelpText() {
     "/append <file> | <text> - append text",
     "/mkdir <dir> - create directory",
     "/delete <path> - delete file or empty dir",
+    "/reset - reset agent session (clears history and state)",
   ].join("\n");
 }
 
 async function createApi(token) {
   const baseUrl = `https://api.telegram.org/bot${token}`;
 
-  async function call(method, payload) {
+  async function call(method, payload, { signal } = {}) {
     const res = await fetch(`${baseUrl}/${method}`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
+      signal,
     });
     const data = await res.json();
     if (!data.ok) {
@@ -115,12 +117,12 @@ async function createApi(token) {
   }
 
   return {
-    async getUpdates(offset) {
+    async getUpdates(offset, { signal } = {}) {
       return call("getUpdates", {
         offset,
         timeout: 30,
         allowed_updates: ["message"],
-      });
+      }, { signal });
     },
     async sendMessage(chatId, text) {
       const maxLen = 3900;
@@ -141,13 +143,6 @@ async function createApi(token) {
       return call("sendChatAction", { chat_id: chatId, action });
     },
   };
-}
-
-function isLikelyLongAnalysis(text) {
-  const t = String(text || "").toLowerCase();
-  return /(analy|analyse|sum|total|største|højeste|laveste|gennemsnit|group|grupp|dato|dates?|filter|python|script|overblik|overview|værdier|value)/i.test(
-    t,
-  );
 }
 
 async function main() {
@@ -188,12 +183,16 @@ async function main() {
   const api = await createApi(token);
 
   let stopRequested = false;
-  process.on("SIGINT", () => {
+  const pollController = new AbortController();
+  function shutdown() {
+    if (stopRequested) return;
     stopRequested = true;
-  });
-  process.on("SIGTERM", () => {
-    stopRequested = true;
-  });
+    console.log("Shutting down...");
+    pollController.abort();
+    setTimeout(() => process.exit(0), 500);
+  }
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
 
   function logDebug(...args) {
     if (logLevel === "debug") {
@@ -203,7 +202,7 @@ async function main() {
 
   async function askAgent(message, chatId) {
     const controller = new AbortController();
-    const timeoutMs = 60_000;
+    const timeoutMs = 180_000;
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     let res;
     try {
@@ -289,6 +288,24 @@ async function main() {
     if (cmd === "/agent") {
       if (!rest) throw new Error("Usage: /agent <instruction>");
       return askAgent(rest, chatId);
+    }
+
+    if (cmd === "/reset") {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 10_000);
+      try {
+        const res = await fetch(agentEndpointUrl.replace("/agent/turn", "/agent/reset"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ chatId }),
+          signal: controller.signal,
+        });
+        const data = await res.json().catch(() => ({}));
+        if (data.ok) return "Session reset. I've forgotten our conversation — let's start fresh!";
+        throw new Error(data.error || "Reset failed");
+      } finally {
+        clearTimeout(timer);
+      }
     }
 
     if (cmd === "/pwd") {
@@ -382,7 +399,7 @@ async function main() {
   let offset = 0;
   while (!stopRequested) {
     try {
-      const updates = await api.getUpdates(offset);
+      const updates = await api.getUpdates(offset, { signal: pollController.signal });
       for (const update of updates) {
         offset = update.update_id + 1;
         const msg = update.message;
@@ -409,27 +426,29 @@ async function main() {
         logDebug("Incoming message", { chatId, userId, text: msg.text });
 
         try {
-          const text = msg.text.trim();
-          const isCommand = text.startsWith("/");
+          const rawText = msg.text.trim();
+          const replyText =
+            msg.reply_to_message && typeof msg.reply_to_message.text === "string"
+              ? msg.reply_to_message.text.trim()
+              : "";
+          const text = replyText
+            ? `[Replying to: "${replyText}"]\n\n${rawText}`
+            : rawText;
+          const isCommand = rawText.startsWith("/");
           let response;
           if (isCommand) {
-            response = await handleCommand(text, chatId);
+            response = await handleCommand(rawText, chatId);
           } else if (agentRoutingEnabled) {
-            const shouldShowProgress = isLikelyLongAnalysis(text);
-            let done = false;
-            let progressTimer = null;
-            if (shouldShowProgress) {
+            // Show "typing…" indicator while the agent composes a reply.
+            // Telegram expires the indicator after ~5s, so repeat every 4s.
+            api.sendChatAction(chatId, "typing").catch(() => {});
+            const typingInterval = setInterval(() => {
               api.sendChatAction(chatId, "typing").catch(() => {});
-              progressTimer = setTimeout(() => {
-                if (done) return;
-                api.sendChatAction(chatId, "typing").catch(() => {});
-              }, 2500);
-            }
+            }, 4000);
             try {
               response = await askAgent(text, chatId);
             } finally {
-              done = true;
-              if (progressTimer) clearTimeout(progressTimer);
+              clearInterval(typingInterval);
             }
           } else {
             response = "Agent routing disabled. Use /help for local file commands.";
