@@ -95,6 +95,7 @@ function buildHelpText() {
     "/append <file> | <text> - append text",
     "/mkdir <dir> - create directory",
     "/delete <path> - delete file or empty dir",
+    "/reset - reset agent session (clears history and state)",
   ].join("\n");
 }
 
@@ -201,7 +202,7 @@ async function main() {
 
   async function askAgent(message, chatId) {
     const controller = new AbortController();
-    const timeoutMs = 60_000;
+    const timeoutMs = 180_000;
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     let res;
     try {
@@ -287,6 +288,24 @@ async function main() {
     if (cmd === "/agent") {
       if (!rest) throw new Error("Usage: /agent <instruction>");
       return askAgent(rest, chatId);
+    }
+
+    if (cmd === "/reset") {
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 10_000);
+      try {
+        const res = await fetch(agentEndpointUrl.replace("/agent/turn", "/agent/reset"), {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ chatId }),
+          signal: controller.signal,
+        });
+        const data = await res.json().catch(() => ({}));
+        if (data.ok) return "Session reset. I've forgotten our conversation — let's start fresh!";
+        throw new Error(data.error || "Reset failed");
+      } finally {
+        clearTimeout(timer);
+      }
     }
 
     if (cmd === "/pwd") {
@@ -407,11 +426,18 @@ async function main() {
         logDebug("Incoming message", { chatId, userId, text: msg.text });
 
         try {
-          const text = msg.text.trim();
-          const isCommand = text.startsWith("/");
+          const rawText = msg.text.trim();
+          const replyText =
+            msg.reply_to_message && typeof msg.reply_to_message.text === "string"
+              ? msg.reply_to_message.text.trim()
+              : "";
+          const text = replyText
+            ? `[Replying to: "${replyText}"]\n\n${rawText}`
+            : rawText;
+          const isCommand = rawText.startsWith("/");
           let response;
           if (isCommand) {
-            response = await handleCommand(text, chatId);
+            response = await handleCommand(rawText, chatId);
           } else if (agentRoutingEnabled) {
             // Show "typing…" indicator while the agent composes a reply.
             // Telegram expires the indicator after ~5s, so repeat every 4s.
