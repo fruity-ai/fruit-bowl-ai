@@ -22,6 +22,8 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const projectRoot = path.resolve(__dirname, "..");
 
+let _debug = () => {};
+
 const DEFAULT_AGENT_NAME = "Fruit Bowl Agent";
 const DEFAULT_AGENT_ROLE =
   "You are a service-minded assistant. You can answer general questions and use enabled local skills when they provide better results.";
@@ -159,7 +161,7 @@ function uniqueModels(models) {
 }
 
 function buildModelCandidates(primaryModel) {
-  return uniqueModels([primaryModel, "gpt-5-codex", "gpt-4.1"]);
+  return uniqueModels([primaryModel, "gpt-4.1"]);
 }
 
 async function callResponsesApi({
@@ -173,6 +175,7 @@ async function callResponsesApi({
   const errors = [];
 
   for (const candidate of candidates) {
+    _debug(`openai call [${candidate}]`, `max_tokens=${maxOutputTokens}`);
     const resp = await fetchJsonWithTimeout(
       "https://api.openai.com/v1/responses",
       {
@@ -192,11 +195,19 @@ async function callResponsesApi({
 
     if (resp.ok) {
       const data = await resp.json();
-      return { data, modelUsed: candidate };
+      const text = extractResponseText(data);
+      _debug(`openai response [${candidate}]`, text ? text.slice(0, 300) : `(empty) keys=${Object.keys(data || {}).join(",")}`);
+      if (text) {
+        return { data, modelUsed: candidate };
+      }
+      // Model returned 200 but no extractable text — try next candidate
+      errors.push(`${candidate}: 200 but empty response text`);
+      continue;
     }
 
     const txt = await resp.text();
     errors.push(`${candidate}: ${resp.status} ${txt}`);
+    _debug(`openai error [${candidate}]`, `${resp.status} ${txt.slice(0, 300)}`);
   }
 
   throw new Error(`OpenAI responses call failed for all models. ${errors.join(" | ")}`);
@@ -244,17 +255,11 @@ function buildExecutionResultSnippet(executionResult, maxLines = 14, maxChars = 
   return text.length > maxChars ? `${text.slice(0, maxChars)}\n...[truncated]` : text;
 }
 
-function ensureReplyContainsResult(reply, resultSnippet) {
-  if (!resultSnippet.trim()) return reply;
-  const normalizedReply = String(reply || "").toLowerCase();
-  const probe = resultSnippet
-    .split("\n")
-    .map((line) => line.trim())
-    .find((line) => line.length >= 8);
-  if (probe && normalizedReply.includes(probe.toLowerCase())) {
-    return reply;
-  }
-  return [reply.trim(), "", "Resultat:", "```text", resultSnippet, "```"].join("\n");
+function ensureReplyContainsResult(reply, _resultSnippet) {
+  // Trust the LLM's composed reply — the system prompt instructs it to
+  // include key values inline.  Appending raw JSON/dict snippets produces
+  // ugly output in Telegram, so we no longer do that.
+  return reply;
 }
 
 function summarizeExecutionResult(executionResult, maxChars = 280) {
@@ -786,9 +791,10 @@ async function composeChatReply({
   const systemPrompt = [
     `You are ${agentContext.agentName}.`,
     agentContext.agentRole,
-    "Write a direct, service-minded answer in the user's language.",
-    "This is a Telegram chat response.",
-    "When relevant, mention what skills are available without sounding robotic.",
+    "Write a short, natural Telegram chat reply in the user's language.",
+    "Do NOT use markdown code blocks (``` or ```).",
+    "Keep it conversational — like a helpful colleague in a chat.",
+    "When relevant, briefly mention what you can help with.",
     "Do not expose internal planning.",
   ].join(" ");
 
@@ -860,28 +866,23 @@ async function composeSkillReply({
         .join("\n")
     : "";
   const fallback = [
-    ...(planSnippet ? ["Plan:", planSnippet, ""] : []),
     `Her er resultatet fra ${skill.name || skill.id}:`,
     "",
-    "```text",
     resultSnippet,
-    "```",
   ].join("\n");
 
   if (!apiKey) return fallback;
 
   const systemPrompt = [
     `You are ${agentContext.agentName}.`,
-    "Write a concise final chat response in the user's language.",
-    "If planningTrace is provided, start with a short plan section before the result.",
-    "You MUST include concrete output values from the execution result.",
-    "If data rows are present, show a compact data preview block.",
-    "Do not only describe what happened; show what was found.",
-    "Use this structure:",
-    "1) direct answer",
-    "2) data/result preview",
-    "3) one useful next-step suggestion",
-    "Use user's language and do not expose internal JSON/planning.",
+    "Write a short, natural Telegram chat reply in the user's language.",
+    "Include the key numbers/values from the execution result directly in your answer.",
+    "When the result contains multiple items (e.g. per-channel, per-campaign, per-category breakdowns), format them as a bulleted list using • as the bullet character.",
+    "Do NOT use markdown code blocks (``` or ```).",
+    "Do NOT show raw JSON, tables, or technical formatting.",
+    "Do NOT reveal planning steps or internal process.",
+    "Keep it conversational — like a helpful colleague replying in a chat.",
+    "If useful, end with one brief follow-up suggestion.",
   ].join(" ");
 
   const userPrompt = [
@@ -934,7 +935,16 @@ async function main() {
   const port = Number(envValue("AGENT_PORT", env, "8787")) || 8787;
   const host = envValue("AGENT_HOST", env, "127.0.0.1").trim() || "127.0.0.1";
   const apiKey = envValue("OPENAI_API_KEY", env, "").trim();
-  const model = envValue("CODEX_MODEL", env, "gpt-codex-5.2").trim() || "gpt-codex-5.2";
+  const model = envValue("CODEX_MODEL", env, "gpt-5.2-codex").trim() || "gpt-5.2-codex";
+  const logLevel = envValue("LOG_LEVEL", env, "info").trim().toLowerCase();
+
+  function logDebug(label, data) {
+    if (logLevel !== "debug") return;
+    const ts = new Date().toISOString().slice(11, 23);
+    const body = typeof data === "string" ? data : JSON.stringify(data, null, 2);
+    console.log(`[debug ${ts}] ${label}:`, body);
+  }
+  _debug = logDebug;
 
   const memoryRootRaw = envValue("MEMORY_ROOT", env, "./memory").trim() || "./memory";
   const memoryRoot = path.isAbsolute(memoryRootRaw)
@@ -988,15 +998,18 @@ async function main() {
       }
 
       const skills = await loadSkillsRuntime({ projectRoot, memoryRoot, datafilesRoot });
+      logDebug("skills loaded", skills.map((s) => s.id));
       const skillContexts = new Map();
       await Promise.all(
         skills.map(async (skill) => {
           try {
             const ctx = await getSkillContext(skill, 30_000);
             skillContexts.set(skill.id, ctx);
+            logDebug(`skill context [${skill.id}]`, { ok: ctx?.ok, keys: Object.keys(ctx || {}) });
           } catch (err) {
             const reason = err instanceof Error ? err.message : String(err);
             skillContexts.set(skill.id, { ok: false, error: reason });
+            logDebug(`skill context [${skill.id}] FAILED`, reason);
           }
         }),
       );
@@ -1060,8 +1073,18 @@ async function main() {
             },
           });
         } catch (err) {
+          const reason = err instanceof Error ? err.message : String(err);
+          logDebug(`router error (attempt ${attempt})`, reason);
           decision = normalizeRouterDecision({ mode: "chat", assistant_reply: "" });
         }
+
+        logDebug(`router decision (attempt ${attempt})`, {
+          mode: decision.mode,
+          skill_id: decision.skill_id,
+          action: decision.action,
+          reply: decision.assistant_reply?.slice(0, 120),
+          state: decision.conversation_state,
+        });
 
         finalDecision = decision;
 
@@ -1091,6 +1114,7 @@ async function main() {
             skillContexts,
             prefilledReply: decision.assistant_reply,
           });
+          logDebug("chat reply", reply.slice(0, 300));
           session = appendSessionHistory(session, "user", message, MAX_SESSION_HISTORY);
           session = appendSessionHistory(session, "assistant", reply, MAX_SESSION_HISTORY);
           session = applySessionStatePatch(session, {
@@ -1166,6 +1190,12 @@ async function main() {
           executionResult = { ok: false, error: reason };
         }
 
+        logDebug(`skill exec [${skill.id}]`, {
+          ok: executionResult?.ok,
+          error: executionResult?.error,
+          resultPreview: typeof executionResult?.result === "string" ? executionResult.result.slice(0, 200) : undefined,
+        });
+
         const shouldIterate =
           skillSupportsOperation(skill, "python_code") &&
           shouldUseIterativeDataLoop(message, decision, executionResult);
@@ -1228,6 +1258,7 @@ async function main() {
           agentContext,
           planningTrace,
         });
+        logDebug("skill reply", reply.slice(0, 300));
 
         session = appendSessionHistory(session, "user", message, MAX_SESSION_HISTORY);
         session = appendSessionHistory(session, "assistant", reply, MAX_SESSION_HISTORY);
