@@ -202,7 +202,7 @@ async function main() {
 
   async function askAgent(message, chatId) {
     const controller = new AbortController();
-    const timeoutMs = 180_000;
+    const timeoutMs = 120_000;
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     let res;
     try {

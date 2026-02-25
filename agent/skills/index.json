@@ -46,6 +46,39 @@
           "payload": {}
         }
       }
+    },
+    {
+      "id": "memory-writer",
+      "name": "Memory Writer",
+      "description": "Save notes and knowledge to persistent memory folders (memory/notes and memory/knowledge).",
+      "when_to_use": "Use when the agent should persist information for future sessions: save analysis findings to knowledge, save working notes or session summaries to notes, or when the user explicitly asks to remember or save something.",
+      "action_contract": "Set action.operation to one of write, append, list. Set action.folder to 'notes' or 'knowledge'. For write/append set action.filename (kebab-case, .md extension) and action.content (the text to save). Use 'knowledge' for confirmed insights and stable reference material. Use 'notes' for session summaries, observations, and working documents.",
+      "entry": "agent/skills/memory-writer/SKILL.md",
+      "enabled": true,
+      "root": "${MEMORY_ROOT}",
+      "operations": [
+        "write",
+        "append",
+        "list"
+      ],
+      "examples": [
+        "husk at den vigtigste metrik er ROAS",
+        "gem et resumé af denne analyse",
+        "save this insight for later",
+        "skriv en note om dagens findings",
+        "hvad har du gemt i notes?"
+      ],
+      "self_test_questions": [
+        "Gem en note om at datasættet indeholder finansielle transaktioner.",
+        "Hvad ligger der i knowledge-mappen?",
+        "Tilføj en observation til mine noter."
+      ],
+      "executor": {
+        "type": "node_module",
+        "module": "agent/skills/memory-writer/executor.mjs",
+        "contextTimeoutMs": 5000,
+        "executeTimeoutMs": 10000
+      }
     }
   ]
 }

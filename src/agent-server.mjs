@@ -803,8 +803,11 @@ async function routeTurnWithModel({
     "- For file-list or data-availability questions, prefer mode=chat and answer from provided skill contexts/catalog.",
     "- Follow the selected skill action_contract when constructing action payload.",
     "- Never invent skill ids. Use only listed skills.",
-    "- Almost never choose mode=clarify. Instead, make your best guess, act on it, and explain what you chose. Only use mode=clarify when the request could mean two completely unrelated things with no way to guess.",
-    "- When making assumptions or narrowing scope, set assistant_reply to briefly explain what you chose and why.",
+    "- If user intent is ambiguous, choose clarify.",
+    "- When the user asks you to remember, save, or note something, use the memory-writer skill.",
+    "- After completing a meaningful data analysis, proactively save key findings to memory/knowledge using the memory-writer skill (use a follow-up turn or mention it in state_updates).",
+    "- Use folder='knowledge' for confirmed facts, stable insights, and reference material worth keeping across sessions.",
+    "- Use folder='notes' for session summaries, working observations, and temporary findings.",
     "- Keep output minimal and valid JSON.",
   ].join(" ");
 
