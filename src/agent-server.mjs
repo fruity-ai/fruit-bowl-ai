@@ -12,6 +12,7 @@ import {
   appendSessionHistory,
   applySessionStatePatch,
   buildSessionPromptState,
+  createDefaultSession,
   getRecentHistory,
   loadSession,
   saveSession,
@@ -21,6 +22,8 @@ import { consumeEvents, pushEvent } from "./session-events.mjs";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const projectRoot = path.resolve(__dirname, "..");
+
+let _debug = () => {};
 
 const DEFAULT_AGENT_NAME = "Fruit Bowl Agent";
 const DEFAULT_AGENT_ROLE =
@@ -159,7 +162,7 @@ function uniqueModels(models) {
 }
 
 function buildModelCandidates(primaryModel) {
-  return uniqueModels([primaryModel, "gpt-5-codex", "gpt-4.1"]);
+  return uniqueModels([primaryModel, "gpt-4.1"]);
 }
 
 async function callResponsesApi({
@@ -168,11 +171,20 @@ async function callResponsesApi({
   input,
   maxOutputTokens = 700,
   timeoutMs = 45_000,
+  temperature,
 }) {
   const candidates = buildModelCandidates(model);
   const errors = [];
 
   for (const candidate of candidates) {
+    _debug(`openai call [${candidate}]`, `max_tokens=${maxOutputTokens}`);
+    const body = {
+      model: candidate,
+      input,
+      max_output_tokens: maxOutputTokens,
+    };
+    const supportsTemperature = !candidate.includes("codex");
+    if (typeof temperature === "number" && supportsTemperature) body.temperature = temperature;
     const resp = await fetchJsonWithTimeout(
       "https://api.openai.com/v1/responses",
       {
@@ -181,25 +193,39 @@ async function callResponsesApi({
           Authorization: `Bearer ${apiKey}`,
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({
-          model: candidate,
-          input,
-          max_output_tokens: maxOutputTokens,
-        }),
+        body: JSON.stringify(body),
       },
       timeoutMs,
     );
 
     if (resp.ok) {
       const data = await resp.json();
-      return { data, modelUsed: candidate };
+      const text = extractResponseText(data);
+      _debug(
+        `openai response [${candidate}]`,
+        text
+          ? text.slice(0, 300)
+          : `(empty) keys=${Object.keys(data || {}).join(",")}`,
+      );
+      if (text) {
+        return { data, modelUsed: candidate };
+      }
+      // Model returned 200 but no extractable text — try next candidate
+      errors.push(`${candidate}: 200 but empty response text`);
+      continue;
     }
 
     const txt = await resp.text();
     errors.push(`${candidate}: ${resp.status} ${txt}`);
+    _debug(
+      `openai error [${candidate}]`,
+      `${resp.status} ${txt.slice(0, 300)}`,
+    );
   }
 
-  throw new Error(`OpenAI responses call failed for all models. ${errors.join(" | ")}`);
+  throw new Error(
+    `OpenAI responses call failed for all models. ${errors.join(" | ")}`,
+  );
 }
 
 function extractResponseText(data) {
@@ -229,32 +255,34 @@ function extractJsonObject(text) {
 }
 
 function getChatKey(body) {
-  if (typeof body.chatId === "number" && Number.isFinite(body.chatId)) return `chat:${body.chatId}`;
-  if (typeof body.chatId === "string" && body.chatId.trim()) return `chat:${body.chatId.trim()}`;
+  if (typeof body.chatId === "number" && Number.isFinite(body.chatId))
+    return `chat:${body.chatId}`;
+  if (typeof body.chatId === "string" && body.chatId.trim())
+    return `chat:${body.chatId.trim()}`;
   return "chat:default";
 }
 
-function buildExecutionResultSnippet(executionResult, maxLines = 14, maxChars = 2600) {
+function buildExecutionResultSnippet(
+  executionResult,
+  maxLines = 14,
+  maxChars = 2600,
+) {
   const raw =
     typeof executionResult?.result === "string" && executionResult.result.trim()
       ? executionResult.result.trim()
       : JSON.stringify(executionResult, null, 2);
   const lines = raw.split("\n").slice(0, maxLines);
   const text = lines.join("\n");
-  return text.length > maxChars ? `${text.slice(0, maxChars)}\n...[truncated]` : text;
+  return text.length > maxChars
+    ? `${text.slice(0, maxChars)}\n...[truncated]`
+    : text;
 }
 
-function ensureReplyContainsResult(reply, resultSnippet) {
-  if (!resultSnippet.trim()) return reply;
-  const normalizedReply = String(reply || "").toLowerCase();
-  const probe = resultSnippet
-    .split("\n")
-    .map((line) => line.trim())
-    .find((line) => line.length >= 8);
-  if (probe && normalizedReply.includes(probe.toLowerCase())) {
-    return reply;
-  }
-  return [reply.trim(), "", "Resultat:", "```text", resultSnippet, "```"].join("\n");
+function ensureReplyContainsResult(reply, _resultSnippet) {
+  // Trust the LLM's composed reply — the system prompt instructs it to
+  // include key values inline.  Appending raw JSON/dict snippets produces
+  // ugly output in Telegram, so we no longer do that.
+  return reply;
 }
 
 function summarizeExecutionResult(executionResult, maxChars = 280) {
@@ -263,12 +291,15 @@ function summarizeExecutionResult(executionResult, maxChars = 280) {
 }
 
 function buildReferenceMemory(sessionState) {
-  const state = sessionState && typeof sessionState === "object" ? sessionState : {};
+  const state =
+    sessionState && typeof sessionState === "object" ? sessionState : {};
   return {
     objective: String(state.objective || ""),
     active_skill_id: String(state.active_skill_id || ""),
     awaiting_user_input: String(state.awaiting_user_input || "none"),
-    missing_fields: Array.isArray(state.missing_fields) ? state.missing_fields : [],
+    missing_fields: Array.isArray(state.missing_fields)
+      ? state.missing_fields
+      : [],
     last_selected_file: String(state.last_selected_file || ""),
     last_result_summary: String(state.last_result_summary || ""),
   };
@@ -296,32 +327,46 @@ function summarizeSkillContext(raw) {
 }
 
 function normalizeRouterDecision(raw) {
-  const modeRaw = typeof raw?.mode === "string" ? raw.mode.trim().toLowerCase() : "chat";
-  const mode = ["chat", "skill", "clarify"].includes(modeRaw) ? modeRaw : "chat";
+  const modeRaw =
+    typeof raw?.mode === "string" ? raw.mode.trim().toLowerCase() : "chat";
+  const mode = ["chat", "skill", "clarify"].includes(modeRaw)
+    ? modeRaw
+    : "chat";
   const skillId = typeof raw?.skill_id === "string" ? raw.skill_id.trim() : "";
-  const action = raw?.action && typeof raw.action === "object" ? raw.action : {};
+  const action =
+    raw?.action && typeof raw.action === "object" ? raw.action : {};
   const assistantReply =
     typeof raw?.assistant_reply === "string" && raw.assistant_reply.trim()
       ? raw.assistant_reply.trim()
       : "";
   const clarifyingQuestion =
-    typeof raw?.clarifying_question === "string" && raw.clarifying_question.trim()
+    typeof raw?.clarifying_question === "string" &&
+    raw.clarifying_question.trim()
       ? raw.clarifying_question.trim()
       : "";
   const conversationStateRaw =
-    typeof raw?.conversation_state === "string" ? raw.conversation_state.trim().toLowerCase() : "";
-  const conversationState = ["normal", "awaiting_confirmation", "awaiting_missing_param", "executing"].includes(
-    conversationStateRaw,
-  )
+    typeof raw?.conversation_state === "string"
+      ? raw.conversation_state.trim().toLowerCase()
+      : "";
+  const conversationState = [
+    "normal",
+    "awaiting_confirmation",
+    "awaiting_missing_param",
+    "executing",
+  ].includes(conversationStateRaw)
     ? conversationStateRaw
     : "";
   const missingFields = Array.isArray(raw?.missing_fields)
     ? raw.missing_fields.map((v) => String(v || "").trim()).filter(Boolean)
     : [];
-  const resolvedReferences = raw?.resolved_references && typeof raw.resolved_references === "object"
-    ? raw.resolved_references
-    : {};
-  const stateUpdates = raw?.state_updates && typeof raw.state_updates === "object" ? raw.state_updates : {};
+  const resolvedReferences =
+    raw?.resolved_references && typeof raw.resolved_references === "object"
+      ? raw.resolved_references
+      : {};
+  const stateUpdates =
+    raw?.state_updates && typeof raw.state_updates === "object"
+      ? raw.state_updates
+      : {};
   return {
     mode,
     skill_id: skillId,
@@ -364,9 +409,16 @@ function pickLikelyFileFromCatalog(catalog, message, history) {
     for (const token of stem.split(/[^a-z0-9æøå]+/i)) {
       if (token && token.length > 2 && haystack.includes(token)) score += 2;
     }
-    const cols = Array.isArray(item?.columns) ? item.columns.map((c) => String(c).toLowerCase()) : [];
+    const cols = Array.isArray(item?.columns)
+      ? item.columns.map((c) => String(c).toLowerCase())
+      : [];
     if (cols.includes("beløb") || cols.includes("belob")) score += 3;
-    if (cols.includes("dato") || cols.includes("date") || cols.includes("event_date")) score += 2;
+    if (
+      cols.includes("dato") ||
+      cols.includes("date") ||
+      cols.includes("event_date")
+    )
+      score += 2;
     if (score > best.score) best = { file, score };
   }
   return best.file;
@@ -377,8 +429,9 @@ function buildHeuristicPythonPlan({ message, history, catalog }) {
   const file = pickLikelyFileFromCatalog(catalog, message, history);
 
   const asksTopByDate =
-    /(hvilke|which|what).*(dage|dato|dates?).*(største|højeste|largest|highest|top)/i.test(text) ||
-    /største.*(værdi|value|beløb|amount)/i.test(text);
+    /(hvilke|which|what).*(dage|dato|dates?).*(største|højeste|largest|highest|top)/i.test(
+      text,
+    ) || /største.*(værdi|value|beløb|amount)/i.test(text);
   if (asksTopByDate) {
     return normalizePythonPlan({
       file: file || undefined,
@@ -404,8 +457,9 @@ function buildHeuristicPythonPlan({ message, history, catalog }) {
   }
 
   const asksDates =
-    /(hvilke|which|what).*(dage|dato|dates?).*(med|er|finnes|findes)?/i.test(text) ||
-    /dates?.*(dataset|data)/i.test(text);
+    /(hvilke|which|what).*(dage|dato|dates?).*(med|er|finnes|findes)?/i.test(
+      text,
+    ) || /dates?.*(dataset|data)/i.test(text);
   if (asksDates) {
     return normalizePythonPlan({
       file: file || undefined,
@@ -423,21 +477,27 @@ function buildHeuristicPythonPlan({ message, history, catalog }) {
 
   return normalizePythonPlan({
     file: file || undefined,
-    explanation: "Jeg starter med et preview for at fastlægge den rette analyse.",
+    explanation:
+      "Jeg starter med et preview for at fastlægge den rette analyse.",
     limit: 20,
     code: "source = df.copy() if 'df' in locals() else read_table(discover_files()[0])\nresult = source.head(20)",
   });
 }
 
 function normalizePythonPlan(raw) {
-  const file = typeof raw?.file === "string" && raw.file.trim() ? raw.file.trim() : undefined;
+  const file =
+    typeof raw?.file === "string" && raw.file.trim()
+      ? raw.file.trim()
+      : undefined;
   const code = typeof raw?.code === "string" ? raw.code.trim() : "";
   const explanation =
     typeof raw?.explanation === "string" && raw.explanation.trim()
       ? raw.explanation.trim()
       : "Jeg laver en målrettet pandas-analyse.";
   const limitRaw = Number(raw?.limit);
-  const limit = Number.isFinite(limitRaw) ? Math.max(5, Math.min(200, Math.floor(limitRaw))) : 50;
+  const limit = Number.isFinite(limitRaw)
+    ? Math.max(5, Math.min(200, Math.floor(limitRaw)))
+    : 50;
   return { file, code, explanation, limit };
 }
 
@@ -453,7 +513,8 @@ async function planPythonCodeWithModel({
   if (!apiKey) {
     return normalizePythonPlan({
       code: "result = df.head(10) if 'df' in locals() else read_table(discover_files()[0]).head(10)",
-      explanation: "Jeg starter med et sikkert preview, da OpenAI ikke er konfigureret.",
+      explanation:
+        "Jeg starter med et sikkert preview, da OpenAI ikke er konfigureret.",
       limit: 20,
     });
   }
@@ -494,8 +555,9 @@ async function planPythonCodeWithModel({
       { role: "system", content: [{ type: "input_text", text: systemPrompt }] },
       { role: "user", content: [{ type: "input_text", text: userPrompt }] },
     ],
-    maxOutputTokens: 900,
+    maxOutputTokens: 1500,
     timeoutMs: 45_000,
+    temperature: 0.2,
   });
   const text = extractResponseText(data);
   if (!text) throw new Error("OpenAI python-plan returned empty output");
@@ -536,24 +598,29 @@ async function evaluatePythonResultWithModel({
       apiKey,
       model,
       input: [
-        { role: "system", content: [{ type: "input_text", text: systemPrompt }] },
+        {
+          role: "system",
+          content: [{ type: "input_text", text: systemPrompt }],
+        },
         { role: "user", content: [{ type: "input_text", text: userPrompt }] },
       ],
-      maxOutputTokens: 300,
+      maxOutputTokens: 500,
       timeoutMs: 30_000,
+      temperature: 0.2,
     });
     data = out.data;
   } catch {
-    return { satisfied: true, reason: "evaluation_http_fallback" };
+    return { satisfied: false, reason: "evaluation_http_fallback" };
   }
   const text = extractResponseText(data);
-  if (!text) return { satisfied: true, reason: "evaluation_empty_fallback" };
+  if (!text) return { satisfied: false, reason: "evaluation_empty_fallback" };
   const parsed = extractJsonObject(text);
   return {
     satisfied: parsed?.satisfied === true,
     reason: typeof parsed?.reason === "string" ? parsed.reason : "",
     next_instruction:
-      typeof parsed?.next_instruction === "string" && parsed.next_instruction.trim()
+      typeof parsed?.next_instruction === "string" &&
+      parsed.next_instruction.trim()
         ? parsed.next_instruction.trim()
         : "",
   };
@@ -562,15 +629,16 @@ async function evaluatePythonResultWithModel({
 function shouldUseIterativeDataLoop(message, decision, executionResult) {
   const text = String(message || "").toLowerCase();
   const likelyAnalytical =
-    /(sum|total|største|højeste|laveste|gennemsnit|overblik|overview|hvilke datoer|periode|top|group|grupp|analyse)/i.test(
+    /(sum|total|count|avg|mean|max|min|largest|smallest|biggest|highest|lowest|most|least|største|højeste|laveste|gennemsnit|overblik|overview|hvilke|periode|top|bottom|group|grupp|analyse|analys|compare|compar|trend|change|growth|decline|difference|filter|sort|rank|vis mig|show me|what is|how many|how much|hvor mange|hvor meget|hvad er|beregn|calculat|fordeling|distribut|per\s|by\s)/i.test(
       text,
     );
   const op = String(decision?.action?.operation || "").toLowerCase();
   const weakOp = !op || op === "preview" || op === "columns";
   const failed = executionResult?.ok === false;
-  return failed || (likelyAnalytical && weakOp);
+  // Use iterative loop for any failed execution, or for analytical questions
+  // (even with non-weak ops, since single-shot results may be incomplete)
+  return failed || likelyAnalytical;
 }
-
 
 async function runIterativePythonDataLoop({
   apiKey,
@@ -580,7 +648,7 @@ async function runIterativePythonDataLoop({
   skill,
   skillContexts,
   executeSkillFn,
-  maxSteps = 3,
+  maxSteps = 5,
 }) {
   const catalog = extractCatalogForSkill(skillContexts, skill.id);
   const planningTrace = [];
@@ -593,7 +661,9 @@ async function runIterativePythonDataLoop({
       plan = await planPythonCodeWithModel({
         apiKey,
         model,
-        message: lastError ? `${message}\n\nPrevious error: ${lastError}` : message,
+        message: lastError
+          ? `${message}\n\nPrevious error: ${lastError}`
+          : message,
         history,
         skill,
         catalog,
@@ -608,7 +678,12 @@ async function runIterativePythonDataLoop({
     }
 
     if (!plan.code) {
-      planningTrace.push({ step, ok: false, error: "empty generated code", plan });
+      planningTrace.push({
+        step,
+        ok: false,
+        error: "empty generated code",
+        plan,
+      });
       lastError = "empty generated code";
       continue;
     }
@@ -659,13 +734,20 @@ async function runIterativePythonDataLoop({
     if (evaluation.satisfied) {
       return { ok: true, executionResult, planningTrace };
     }
-    lastError = evaluation.next_instruction || evaluation.reason || "result not sufficient";
+    lastError =
+      evaluation.next_instruction ||
+      evaluation.reason ||
+      "result not sufficient";
   }
 
   if (lastSuccess) {
     return { ok: true, executionResult: lastSuccess, planningTrace };
   }
-  return { ok: false, error: lastError || "iterative python planning failed", planningTrace };
+  return {
+    ok: false,
+    error: lastError || "iterative python planning failed",
+    planningTrace,
+  };
 }
 
 function buildSkillListForPrompt(skills, skillContexts) {
@@ -709,9 +791,11 @@ async function routeTurnWithModel({
     "- resolved_references: optional object",
     "- state_updates: optional object with session patch fields",
     "Rules:",
+    "- Be autonomous: prefer action over clarification. When user intent is reasonably clear, make a decision and execute.",
+    "- ALWAYS try to answer with data first. Never ask the user to narrow their question before trying. If a question is broad, actively narrow it yourself — pick the most relevant data, time range, or angle — and tell the user what choice you made. E.g. 'I focused on the last 2 weeks of marketing data since that seemed most relevant.'",
     "- Choose mode=chat for normal assistant conversation and general knowledge Q&A.",
-    "- Choose mode=skill only when a skill can provide concrete value.",
-    "- For concrete data analysis requests, prefer mode=skill over clarify.",
+    "- Choose mode=skill when a skill can provide value — don't wait for perfect clarity.",
+    "- For data analysis requests, prefer mode=skill. Pick the most relevant file from the catalog if user didn't specify one.",
     "- For follow-up data questions that reference prior dataset context, stay in mode=skill.",
     "- Interpret short follow-ups from session state + chat history.",
     "- Resolve demonstrative references (e.g. den, den fil, samme fil, this, that file) from session state.",
@@ -761,8 +845,9 @@ async function routeTurnWithModel({
       { role: "system", content: [{ type: "input_text", text: systemPrompt }] },
       { role: "user", content: [{ type: "input_text", text: userPrompt }] },
     ],
-    maxOutputTokens: 450,
+    maxOutputTokens: 800,
     timeoutMs: 45_000,
+    temperature: 0.2,
   });
   const text = extractResponseText(data);
   if (!text) throw new Error("OpenAI route call returned empty response");
@@ -790,9 +875,11 @@ async function composeChatReply({
   const systemPrompt = [
     `You are ${agentContext.agentName}.`,
     agentContext.agentRole,
-    "Write a direct, service-minded answer in the user's language.",
-    "This is a Telegram chat response.",
-    "When relevant, mention what skills are available without sounding robotic.",
+    "Write a short, natural Telegram chat reply in the user's language.",
+    "IMPORTANT: Match the language the user used in their FIRST message of the session. Do not switch language mid-conversation even if skill results or internal data are in a different language.",
+    "Do NOT use markdown code blocks (``` or ```).",
+    "Keep it conversational — like a helpful colleague in a chat.",
+    "When relevant, briefly mention what you can help with.",
     "Do not expose internal planning.",
   ].join(" ");
 
@@ -828,13 +915,19 @@ async function composeChatReply({
       apiKey,
       model,
       input: [
-        { role: "system", content: [{ type: "input_text", text: systemPrompt }] },
+        {
+          role: "system",
+          content: [{ type: "input_text", text: systemPrompt }],
+        },
         { role: "user", content: [{ type: "input_text", text: userPrompt }] },
       ],
       maxOutputTokens: 700,
       timeoutMs: 45_000,
     });
-    return extractResponseText(data) || "Jeg kan ikke svare præcist lige nu. Prøv igen om et øjeblik.";
+    return (
+      extractResponseText(data) ||
+      "Jeg kan ikke svare præcist lige nu. Prøv igen om et øjeblik."
+    );
   } catch {
     return "Jeg kan ikke svare præcist lige nu. Prøv igen om et øjeblik.";
   }
@@ -853,39 +946,41 @@ async function composeSkillReply({
   planningTrace,
 }) {
   const resultSnippet = buildExecutionResultSnippet(executionResult);
-  const planSnippet = Array.isArray(planningTrace) && planningTrace.length
-    ? planningTrace
-        .slice(0, 4)
-        .map((step) => {
-          const explain = step?.plan?.explanation ? `: ${step.plan.explanation}` : "";
-          const status = step?.ok ? "ok" : `fejl (${step?.error || "ukendt"})`;
-          return `- Trin ${step.step} [${status}]${explain}`;
-        })
-        .join("\n")
-    : "";
+  const planSnippet =
+    Array.isArray(planningTrace) && planningTrace.length
+      ? planningTrace
+          .slice(0, 4)
+          .map((step) => {
+            const explain = step?.plan?.explanation
+              ? `: ${step.plan.explanation}`
+              : "";
+            const status = step?.ok
+              ? "ok"
+              : `fejl (${step?.error || "ukendt"})`;
+            return `- Trin ${step.step} [${status}]${explain}`;
+          })
+          .join("\n")
+      : "";
   const fallback = [
-    ...(planSnippet ? ["Plan:", planSnippet, ""] : []),
     `Her er resultatet fra ${skill.name || skill.id}:`,
     "",
-    "```text",
     resultSnippet,
-    "```",
   ].join("\n");
 
   if (!apiKey) return fallback;
 
   const systemPrompt = [
     `You are ${agentContext.agentName}.`,
-    "Write a concise final chat response in the user's language.",
-    "If planningTrace is provided, start with a short plan section before the result.",
-    "You MUST include concrete output values from the execution result.",
-    "If data rows are present, show a compact data preview block.",
-    "Do not only describe what happened; show what was found.",
-    "Use this structure:",
-    "1) direct answer",
-    "2) data/result preview",
-    "3) one useful next-step suggestion",
-    "Use user's language and do not expose internal JSON/planning.",
+    "Write a short, natural Telegram chat reply in the user's language.",
+    "IMPORTANT: Match the language the user used in their FIRST message of the session. Do not switch language mid-conversation even if skill results or internal data are in a different language.",
+    "ALWAYS start your reply with a human-readable summary or finding in plain text. This is the main answer.",
+    "If you had to narrow the scope (e.g. picked a specific time range, file, or metric), briefly explain the choice you made so the user knows. E.g. 'I looked at the last 2 weeks since that seemed most relevant.'",
+    "When the result is based on data files, show supporting data AFTER the summary as key-value pairs with a bold emoji header showing the source file.",
+    "Format data snippets exactly like this:\n\n🗄️ marketing.csv\n\nlatest_date: 2026-02-25\nwindow_start: 2026-02-12\nspend_dkk_sum: 64732.64\nrows_in_window: 42",
+    "When the result contains multiple data sources, write the summary first, then show each source as its own *🗄️ filename* block with key-value pairs.",
+    "Do NOT reveal planning steps or internal process.",
+    "Keep it conversational — like a helpful colleague replying in a chat.",
+    "If useful, end with one brief follow-up suggestion.",
   ].join(" ");
 
   const userPrompt = [
@@ -919,10 +1014,13 @@ async function composeSkillReply({
       apiKey,
       model,
       input: [
-        { role: "system", content: [{ type: "input_text", text: systemPrompt }] },
+        {
+          role: "system",
+          content: [{ type: "input_text", text: systemPrompt }],
+        },
         { role: "user", content: [{ type: "input_text", text: userPrompt }] },
       ],
-      maxOutputTokens: 750,
+      maxOutputTokens: 1200,
       timeoutMs: 45_000,
     });
     const composed = extractResponseText(data) || fallback;
@@ -938,13 +1036,26 @@ async function main() {
   const port = Number(envValue("AGENT_PORT", env, "8787")) || 8787;
   const host = envValue("AGENT_HOST", env, "127.0.0.1").trim() || "127.0.0.1";
   const apiKey = envValue("OPENAI_API_KEY", env, "").trim();
-  const model = envValue("CODEX_MODEL", env, "gpt-codex-5.2").trim() || "gpt-codex-5.2";
+  const model =
+    envValue("CODEX_MODEL", env, "gpt-5.2-codex").trim() || "gpt-5.2-codex";
+  const logLevel = envValue("LOG_LEVEL", env, "info").trim().toLowerCase();
 
-  const memoryRootRaw = envValue("MEMORY_ROOT", env, "./memory").trim() || "./memory";
+  function logDebug(label, data) {
+    if (logLevel !== "debug") return;
+    const ts = new Date().toISOString().slice(11, 23);
+    const body =
+      typeof data === "string" ? data : JSON.stringify(data, null, 2);
+    console.log(`[debug ${ts}] ${label}:`, body);
+  }
+  _debug = logDebug;
+
+  const memoryRootRaw =
+    envValue("MEMORY_ROOT", env, "./memory").trim() || "./memory";
   const memoryRoot = path.isAbsolute(memoryRootRaw)
     ? memoryRootRaw
     : path.resolve(projectRoot, memoryRootRaw);
-  const stateRootRaw = envValue("STATE_ROOT", env, "./state").trim() || "./state";
+  const stateRootRaw =
+    envValue("STATE_ROOT", env, "./state").trim() || "./state";
   const stateRoot = path.isAbsolute(stateRootRaw)
     ? stateRootRaw
     : path.resolve(projectRoot, stateRootRaw);
@@ -968,21 +1079,31 @@ async function main() {
       if (req.method === "GET" && req.url === "/health") {
         return sendJson(res, 200, { ok: true, service: "fruit-bowl-agent" });
       }
+      if (req.method === "POST" && req.url === "/agent/reset") {
+        const body = await readJsonBody(req);
+        const chatKey = getChatKey(body);
+        const fresh = createDefaultSession(chatKey);
+        await saveSession(stateRoot, fresh);
+        logDebug("session reset", chatKey);
+        return sendJson(res, 200, { ok: true, chat_key: chatKey });
+      }
       if (req.method !== "POST" || req.url !== "/agent/turn") {
         return sendJson(res, 404, { ok: false, error: "not found" });
       }
 
       const body = await readJsonBody(req);
-      const message = typeof body.message === "string" ? body.message.trim() : "";
+      const message =
+        typeof body.message === "string" ? body.message.trim() : "";
       if (!message) {
         return sendJson(res, 400, { ok: false, error: "message is required" });
       }
 
-      const [agentInstructions, agentConfigRaw, memorySnapshot] = await Promise.all([
-        readUtf8IfExists(agentInstructionsPath),
-        readUtf8IfExists(agentConfigPath),
-        buildMemorySnapshot(memoryRoot),
-      ]);
+      const [agentInstructions, agentConfigRaw, memorySnapshot] =
+        await Promise.all([
+          readUtf8IfExists(agentInstructionsPath),
+          readUtf8IfExists(agentConfigPath),
+          buildMemorySnapshot(memoryRoot),
+        ]);
 
       let agentConfig = {};
       try {
@@ -991,16 +1112,29 @@ async function main() {
         agentConfig = {};
       }
 
-      const skills = await loadSkillsRuntime({ projectRoot, memoryRoot, datafilesRoot });
+      const skills = await loadSkillsRuntime({
+        projectRoot,
+        memoryRoot,
+        datafilesRoot,
+      });
+      logDebug(
+        "skills loaded",
+        skills.map((s) => s.id),
+      );
       const skillContexts = new Map();
       await Promise.all(
         skills.map(async (skill) => {
           try {
             const ctx = await getSkillContext(skill, 30_000);
             skillContexts.set(skill.id, ctx);
+            logDebug(`skill context [${skill.id}]`, {
+              ok: ctx?.ok,
+              keys: Object.keys(ctx || {}),
+            });
           } catch (err) {
             const reason = err instanceof Error ? err.message : String(err);
             skillContexts.set(skill.id, { ok: false, error: reason });
+            logDebug(`skill context [${skill.id}] FAILED`, reason);
           }
         }),
       );
@@ -1018,11 +1152,13 @@ async function main() {
 
       const agentContext = {
         agentName:
-          typeof agentConfig?.agentName === "string" && agentConfig.agentName.trim()
+          typeof agentConfig?.agentName === "string" &&
+          agentConfig.agentName.trim()
             ? agentConfig.agentName.trim()
             : DEFAULT_AGENT_NAME,
         agentRole:
-          typeof agentConfig?.agentRole === "string" && agentConfig.agentRole.trim()
+          typeof agentConfig?.agentRole === "string" &&
+          agentConfig.agentRole.trim()
             ? agentConfig.agentRole.trim()
             : DEFAULT_AGENT_ROLE,
         notes:
@@ -1064,8 +1200,21 @@ async function main() {
             },
           });
         } catch (err) {
-          decision = normalizeRouterDecision({ mode: "chat", assistant_reply: "" });
+          const reason = err instanceof Error ? err.message : String(err);
+          logDebug(`router error (attempt ${attempt})`, reason);
+          decision = normalizeRouterDecision({
+            mode: "chat",
+            assistant_reply: "",
+          });
         }
+
+        logDebug(`router decision (attempt ${attempt})`, {
+          mode: decision.mode,
+          skill_id: decision.skill_id,
+          action: decision.action,
+          reply: decision.assistant_reply?.slice(0, 120),
+          state: decision.conversation_state,
+        });
 
         finalDecision = decision;
 
@@ -1076,7 +1225,9 @@ async function main() {
               ? decision.resolved_references.file.trim()
               : "";
           const actionFile =
-            typeof decision?.action?.file === "string" ? decision.action.file.trim() : "";
+            typeof decision?.action?.file === "string"
+              ? decision.action.file.trim()
+              : "";
           if (refFile && !actionFile) {
             decision.action = { ...(decision.action || {}), file: refFile };
           }
@@ -1095,8 +1246,19 @@ async function main() {
             skillContexts,
             prefilledReply: decision.assistant_reply,
           });
-          session = appendSessionHistory(session, "user", message, MAX_SESSION_HISTORY);
-          session = appendSessionHistory(session, "assistant", reply, MAX_SESSION_HISTORY);
+          logDebug("chat reply", reply.slice(0, 300));
+          session = appendSessionHistory(
+            session,
+            "user",
+            message,
+            MAX_SESSION_HISTORY,
+          );
+          session = appendSessionHistory(
+            session,
+            "assistant",
+            reply,
+            MAX_SESSION_HISTORY,
+          );
           session = applySessionStatePatch(session, {
             ...(decision.state_updates || {}),
             conversation_state: decision.conversation_state || "normal",
@@ -1121,17 +1283,34 @@ async function main() {
             decision.clarifying_question ||
             decision.assistant_reply ||
             "Kan du beskrive kort hvad du vil have hjælp til?";
-          session = appendSessionHistory(session, "user", message, MAX_SESSION_HISTORY);
-          session = appendSessionHistory(session, "assistant", reply, MAX_SESSION_HISTORY);
+          session = appendSessionHistory(
+            session,
+            "user",
+            message,
+            MAX_SESSION_HISTORY,
+          );
+          session = appendSessionHistory(
+            session,
+            "assistant",
+            reply,
+            MAX_SESSION_HISTORY,
+          );
           session = applySessionStatePatch(session, {
             ...(decision.state_updates || {}),
-            conversation_state: decision.conversation_state || "awaiting_missing_param",
+            conversation_state:
+              decision.conversation_state || "awaiting_missing_param",
             awaiting_user_input:
-              decision.conversation_state === "awaiting_confirmation" ? "confirmation" : "missing_param",
+              decision.conversation_state === "awaiting_confirmation"
+                ? "confirmation"
+                : "missing_param",
             missing_fields: decision.missing_fields || [],
             active_plan: decision.assistant_reply || "",
           });
-          session = pushEvent(session, `Clarification requested: ${reply}`, "clarify");
+          session = pushEvent(
+            session,
+            `Clarification requested: ${reply}`,
+            "clarify",
+          );
           await saveSession(stateRoot, session);
           return sendJson(res, 200, {
             ok: true,
@@ -1170,6 +1349,15 @@ async function main() {
           executionResult = { ok: false, error: reason };
         }
 
+        logDebug(`skill exec [${skill.id}]`, {
+          ok: executionResult?.ok,
+          error: executionResult?.error,
+          resultPreview:
+            typeof executionResult?.result === "string"
+              ? executionResult.result.slice(0, 200)
+              : undefined,
+        });
+
         const shouldIterate =
           skillSupportsOperation(skill, "python_code") &&
           shouldUseIterativeDataLoop(message, decision, executionResult);
@@ -1183,13 +1371,16 @@ async function main() {
               skill,
               skillContexts,
               executeSkillFn: executeSkill,
-              maxSteps: 3,
+              maxSteps: 5,
             });
             planningTrace = iterative.planningTrace || null;
             if (iterative.ok && iterative.executionResult) {
               executionResult = iterative.executionResult;
             } else if (!executionResult?.ok) {
-              executionResult = { ok: false, error: iterative.error || "iterative analysis failed" };
+              executionResult = {
+                ok: false,
+                error: iterative.error || "iterative analysis failed",
+              };
             }
           } catch (err) {
             const reason = err instanceof Error ? err.message : String(err);
@@ -1200,8 +1391,14 @@ async function main() {
         }
 
         if (!executionResult?.ok) {
-          lastError = String(executionResult?.error || "skill execution failed");
-          session = pushEvent(session, `Skill failed (${skill.id}): ${lastError}`, "error");
+          lastError = String(
+            executionResult?.error || "skill execution failed",
+          );
+          session = pushEvent(
+            session,
+            `Skill failed (${skill.id}): ${lastError}`,
+            "error",
+          );
           attempts.push({
             attempt,
             decision,
@@ -1218,7 +1415,13 @@ async function main() {
         }
 
         finalResult = executionResult;
-        attempts.push({ attempt, decision, skill_id: skill.id, ok: true, planningTrace });
+        attempts.push({
+          attempt,
+          decision,
+          skill_id: skill.id,
+          ok: true,
+          planningTrace,
+        });
 
         const reply = await composeSkillReply({
           apiKey,
@@ -1232,9 +1435,20 @@ async function main() {
           agentContext,
           planningTrace,
         });
+        logDebug("skill reply", reply.slice(0, 300));
 
-        session = appendSessionHistory(session, "user", message, MAX_SESSION_HISTORY);
-        session = appendSessionHistory(session, "assistant", reply, MAX_SESSION_HISTORY);
+        session = appendSessionHistory(
+          session,
+          "user",
+          message,
+          MAX_SESSION_HISTORY,
+        );
+        session = appendSessionHistory(
+          session,
+          "assistant",
+          reply,
+          MAX_SESSION_HISTORY,
+        );
         const selectedFile =
           typeof decision?.resolved_references?.file === "string"
             ? decision.resolved_references.file
@@ -1274,19 +1488,36 @@ async function main() {
 
       const fallbackReply = [
         "Jeg kunne ikke fuldføre opgaven sikkert endnu.",
-        finalSkill ? `Seneste skillforsøg: ${finalSkill.id}` : "Ingen skill blev valgt endeligt.",
-        finalResult?.error ? `Fejl: ${finalResult.error}` : lastError ? `Fejl: ${lastError}` : "",
+        finalSkill
+          ? `Seneste skillforsøg: ${finalSkill.id}`
+          : "Ingen skill blev valgt endeligt.",
+        finalResult?.error
+          ? `Fejl: ${finalResult.error}`
+          : lastError
+            ? `Fejl: ${lastError}`
+            : "",
         "Beskriv gerne ønsket resultat i én sætning, så prøver jeg igen med en ny strategi.",
       ]
         .filter(Boolean)
         .join("\n");
 
-      session = appendSessionHistory(session, "user", message, MAX_SESSION_HISTORY);
-      session = appendSessionHistory(session, "assistant", fallbackReply, MAX_SESSION_HISTORY);
+      session = appendSessionHistory(
+        session,
+        "user",
+        message,
+        MAX_SESSION_HISTORY,
+      );
+      session = appendSessionHistory(
+        session,
+        "assistant",
+        fallbackReply,
+        MAX_SESSION_HISTORY,
+      );
       session = applySessionStatePatch(session, {
         conversation_state: "awaiting_missing_param",
         awaiting_user_input: "missing_param",
-        last_error: finalResult?.error || lastError || "unable to complete task",
+        last_error:
+          finalResult?.error || lastError || "unable to complete task",
       });
       session = pushEvent(
         session,
@@ -1314,7 +1545,9 @@ async function main() {
     console.log(`- DATAFILES_ROOT: ${datafilesRoot}`);
     console.log(`- STATE_ROOT: ${stateRoot}`);
     console.log(`- CODEX_MODEL: ${model}`);
-    console.log(`- OPENAI_API_KEY: ${apiKey ? "set" : "not set (fallback mode)"}`);
+    console.log(
+      `- OPENAI_API_KEY: ${apiKey ? "set" : "not set (fallback mode)"}`,
+    );
   });
 }
 
